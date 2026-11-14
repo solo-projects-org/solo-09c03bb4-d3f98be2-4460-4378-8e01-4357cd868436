@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import logging
 import uuid
+from datetime import date
 
 import psycopg
 from contextlib import asynccontextmanager
@@ -17,9 +18,18 @@ from psycopg_pool import AsyncConnectionPool
 
 from . import db
 from . import sql_helpers as sql
+from . import station_day
 from .config import settings
 from .db import close_pool, init_pool
-from .models import BatchCreate, BatchOut, LongTxOut, ReadingIn, ReadingOut
+from .models import (
+    BatchCreate,
+    BatchOut,
+    LongTxOut,
+    ReadingIn,
+    ReadingOut,
+    StationDayRefreshOut,
+    StationDaySummary,
+)
 from .worker import TERMINAL_STATES, worker
 
 logging.basicConfig(
@@ -56,7 +66,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="水文数仓 · 水位明细索引运维 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "在 PostgreSQL `readings(station_id, observed_at)` 上以 "
         "**CREATE INDEX CONCURRENTLY** 构建普通复合索引的批次化运维服务。\n\n"
@@ -64,7 +74,10 @@ app = FastAPI(
         "- 取消或失败必须等构建会话结束、索引残件删净才进入终态并接收新批；\n"
         "- 清理失败保留待处理状态并自动重试，期间源表普通读写照常；\n"
         "- 批次状态持久化，重启后先停遗留构建、清残件再接新批；\n"
-        "- 只管理固定名称索引与自有构建会话，不删人工索引、不断其他会话。"
+        "- 只管理固定名称索引与自有构建会话，不删人工索引、不断其他会话。\n\n"
+        "另提供**按站日的水位小时汇总**：`POST /station-days/refresh` 从一致的"
+        "已提交快照计算并整日原子发布 24 个小时桶，`GET /station-days` 只读取"
+        "最近一次完整发布；并发刷新时较旧快照不会覆盖较新结果。"
     ),
     lifespan=lifespan,
 )
@@ -316,6 +329,74 @@ async def explain_readings(
         plan = await cur.fetchall()
         await conn.commit()
     return {"plan": plan}
+
+
+# --------------------------------------------------------------------------- #
+# 站日逐小时汇总：一致快照刷新 + 整日原子发布 + 查询
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/station-days/{station_id}/{day}/refresh",
+    response_model=StationDayRefreshOut,
+    tags=["station-days"],
+    summary="刷新一个站日的 24 小时汇总（一致快照计算，整日原子发布）",
+    responses={404: {"description": "站号不存在"}},
+)
+async def refresh_station_day(
+    station_id: int,
+    day: date,
+    p: AsyncConnectionPool = Depends(get_pool),
+) -> StationDayRefreshOut:
+    """按 `observed_at` 所属 UTC 小时汇总该日 `quality='GOOD'` 的 readings。
+
+    - 计算基于一个只读 REPEATABLE READ 事务的已提交快照；刷新期间新写入的
+      观测不会混入本次结果，迟到观测在下次刷新时进入其 observed_at 所属小时。
+    - 24 个小时桶（含缺测小时：`good_count=0`、`max_water_level=null`）与修订号
+      在同一事务整日发布；失败时整体回滚，查询仍看到先前完整的 24 小时。
+    - 两个实例并发刷新同一站日时，若本次快照比已发布修订旧，则不会覆盖，
+      `applied=false` 并返回现行已发布结果。
+    """
+    try:
+        result = await station_day.refresh_day(
+            p, station_id, day,
+            publish_delay=settings.station_day_publish_delay,
+        )
+    except station_day.StationNotFound:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail=f"station {station_id} not found",
+        )
+    log.info(
+        "station-day refreshed: station=%s date=%s revision=%s applied=%s",
+        station_id, day, result["revision"], result["applied"],
+    )
+    return StationDayRefreshOut(**result)
+
+
+@app.get(
+    "/station-days/{station_id}/{day}",
+    response_model=StationDaySummary,
+    tags=["station-days"],
+    summary="查询站日 24 小时汇总（只读最近一次完整发布）",
+    responses={404: {"description": "站号不存在"}},
+)
+async def get_station_day(
+    station_id: int,
+    day: date,
+    p: AsyncConnectionPool = Depends(get_pool),
+) -> StationDaySummary:
+    """永远返回固定 24 个小时桶（0~23）。
+
+    从未成功刷新过的站日返回 `revision=0`、`published=false` 与空小时；
+    刷新失败/服务重启不会暴露半成品，只会看到先前已发布的完整修订。
+    """
+    try:
+        result = await station_day.get_summary(p, station_id, day)
+    except station_day.StationNotFound:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail=f"station {station_id} not found",
+        )
+    return StationDaySummary(**result)
 
 
 # --------------------------------------------------------------------------- #

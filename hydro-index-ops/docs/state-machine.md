@@ -125,3 +125,97 @@
   未进入进度视图时回退显示 `pg_stat_activity.wait_event`。
 - 批次表：`SELECT * FROM index_build_batches ORDER BY id;`
 - 阻塞链与索引有效性：见 `sql/03_observe.sql`。
+
+---
+
+# 站日逐小时汇总：一致性、原子性与并发保证
+
+## 数据模型
+
+| 表 | 作用 |
+|---|---|
+| `station_day_refresh` | 每个 `(station_id, observed_date)` 一行：现行已发布修订号、计算快照、发布时间 |
+| `station_day_hourly` | `(station_id, observed_date, hour)` 一行，`hour ∈ 0..23`；外键指向修订行，孤立小时行被数据库禁止 |
+
+小时行带 `revision` 列，查询 `JOIN ... h.revision = r.revision`，即只读
+**现行修订号**对应的 24 行。
+
+## 刷新流程（`POST /station-days/{station}/{date}/refresh`）
+
+1. 校验测站存在（不存在 → 404）。
+2. 在只读 `REPEATABLE READ` 事务中：
+   - `SELECT pg_current_snapshot()` 取快照；
+   - 同一事务内按 `observed_at` 的 UTC 小时聚合该日 `quality='GOOD'` 的
+     readings（`count(*)`、`max(water_level)`），然后回滚只读事务。
+   计算期间新提交的观测不在该快照内，因此不会混入本次结果。
+3. 在单个读写事务中：
+   - `INSERT ... ON CONFLICT DO UPDATE ... WHERE hydro_snapshot_not_older(
+     EXCLUDED.snapshot, 现行.snapshot)` 抬升修订号；
+   - 若该条件不成立（`RETURNING` 为空）→ 本次落败：**不更新任何行**，
+     回读现行已发布摘要，返回 `applied=false`；
+   - 否则按新修订号 UPSERT 全部 24 个小时行（含缺测小时：0 / null）；
+   - 同一事务内回读摘要后提交。
+4. 任何异常（含注入的提交前失败、进程被杀）→ 事务回滚，旧修订原样保留。
+
+## 关键保证如何落地
+
+### 1. 缺测时段
+
+响应固定 24 项，缺测小时 `good_count=0`、`max_water_level=null`；
+从未刷新过的站日返回 `revision=0`、`published=false` 与全空小时，
+而不是 404 或残缺列表。
+
+### 2. 一致快照 + 迟到观测
+
+- 聚合与取快照在同一 `REPEATABLE READ` 快照下完成；
+- 按 `observed_at`（而非 `ingested_at`）分桶，迟到观测在**下次刷新**时
+  落入其 `observed_at` 所属小时（已由集成测试场景 3 验证）；
+- 刷新期间 `POST /readings` 照常写入，不阻塞刷新，也不被刷新阻塞。
+
+### 3. 整日原子发布
+
+- 修订行与 24 个小时行在同一事务提交；查询按修订号取行，提交前不可见，
+  提交后一次性可见；
+- 发布失败/重启：事务未提交 → 查询仍返回先前完整 24 小时及其修订号
+  （集成测试场景 5、6）。
+
+### 4. 并发刷新仲裁（较旧快照不得覆盖较新结果）
+
+`hydro_snapshot_not_older(a, b)` 定义为“a 的可见范围覆盖 b 看到的所有已提交
+事务”：
+
+```sql
+pg_snapshot_xmax(a) >= pg_snapshot_xmax(b)
+AND NOT EXISTS (SELECT 1 FROM pg_snapshot_xip(a) AS x
+                WHERE pg_visible_in_snapshot(x, b))
+```
+
+- UPSERT 的 `WHERE` 条件在行锁下求值，同一站日的并发发布被串行化；
+- 先到的新快照发布成功后，后到的旧快照条件为 false → 不覆盖、不抬修订号；
+- 先到的旧快照发布后，后到的新快照条件为 true → 正常递增修订号；
+- 两个实例各自使用独立连接，不依赖进程内锁，多副本部署同样成立。
+
+> 说明：`pg_snapshot` 是 PostgreSQL 内置类型（PG13+），比较函数只读取快照
+> 结构，不依赖扩展。
+
+### 5. 修订号语义
+
+`revision` 单调递增，仅在成功发布时 +1；被拒的旧快照刷新不改变修订号。
+查询返回的 `revision` 与 `hours` 始终属于同一次发布，客户端可用
+`(station_id, date, revision)` 作为缓存键。
+
+## 观察点
+
+```sql
+SELECT station_id, observed_date, revision, refreshed_at
+FROM station_day_refresh ORDER BY refreshed_at DESC;
+
+SELECT station_id, observed_date, revision, count(*) AS hours
+FROM station_day_hourly GROUP BY 1, 2, 3 ORDER BY 3 DESC;
+
+-- 任何修订都应恰好 24 行（整日发布不变式）
+SELECT count(*) FROM station_day_hourly h
+JOIN station_day_refresh r USING (station_id, observed_date)
+WHERE h.revision = r.revision
+GROUP BY r.station_id, r.observed_date HAVING count(*) <> 24;
+```

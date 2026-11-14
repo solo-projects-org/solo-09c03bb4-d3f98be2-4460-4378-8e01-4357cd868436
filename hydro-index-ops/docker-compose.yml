@@ -23,21 +23,43 @@ services:
       timeout: 3s
       retries: 20
 
+  # 两个 API 实例共享同一个数据库：可验证并发刷新同一站日时旧快照不覆盖新结果。
+  # 索引批次状态机仍由咨询锁保证只有一个实例驱动（另一个只提供 API）。
   api:
     build: .
     container_name: hydro-api
     depends_on:
       db:
         condition: service_healthy
-    environment:
+    environment: &api-env
       HYDRO_PG_DSN: postgresql://hydro:hydro_pw@db:5432/hydro_warehouse
       HYDRO_WORK_POLL_INTERVAL: "1.0"
       HYDRO_CLEANUP_RETRY_INTERVAL: "3.0"
       # 演示用：让前 N 次清理 DROP 故意失败，观察 PENDING 自动重试（生产置 0）
       HYDRO_CLEANUP_FAIL_FIRST: "0"
+      # 演示/测试用：站日刷新取快照后延迟发布、或提交前注入失败（生产必须为 0/false）
+      HYDRO_STATION_DAY_PUBLISH_DELAY: "0"
+      HYDRO_STATION_DAY_FAIL_BEFORE_COMMIT: "false"
       HYDRO_LOG_LEVEL: INFO
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api2:
+    build: .
+    container_name: hydro-api-2
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    environment: *api-env
+    ports:
+      - "8001:8000"
 
 volumes:
   pgdata:
