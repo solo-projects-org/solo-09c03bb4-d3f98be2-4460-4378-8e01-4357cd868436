@@ -1,0 +1,43 @@
+name: hydro-index-ops
+
+services:
+  db:
+    image: postgres:16
+    container_name: hydro-db
+    environment:
+      POSTGRES_USER: hydro
+      POSTGRES_PASSWORD: hydro_pw
+      POSTGRES_DB: hydro_warehouse
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/01_init_readings.sql:/docker-entrypoint-initdb.d/01_init_readings.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hydro -d hydro_warehouse"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    container_name: hydro-api
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      HYDRO_PG_DSN: postgresql://hydro:hydro_pw@db:5432/hydro_warehouse
+      HYDRO_WORK_POLL_INTERVAL: "1.0"
+      HYDRO_CLEANUP_RETRY_INTERVAL: "3.0"
+      # 演示用：让前 N 次清理 DROP 故意失败，观察 PENDING 自动重试（生产置 0）
+      HYDRO_CLEANUP_FAIL_FIRST: "0"
+      HYDRO_LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:
